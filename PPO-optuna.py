@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions import Categorical
+from torch.utils.data.sampler import BatchSampler, SubsetRandomSampler
 import numpy as np
 import wandb
 import optuna
@@ -12,14 +13,16 @@ import optuna
 class Actor(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim):
         super(Actor, self).__init__()
-        self.fc1 = nn.Linear(state_dim, hidden_dim) 
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, action_dim)
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, action_dim),
+        )
         
     def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = self.fc3(x)
+        x = self.net(x)
         prob = F.softmax(x, dim=-1)
         return prob
 
@@ -27,14 +30,16 @@ class Actor(nn.Module):
 class Critic(nn.Module):
     def __init__(self, state_dim, hidden_dim):
         super(Critic, self).__init__()
-        self.fc1 = nn.Linear(state_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, 1)
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
         
     def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        value = self.fc3(x)
+        value = self.net(x)
         return value
 
 # 定义PPO算法
@@ -48,11 +53,14 @@ class PPO:
                  K_epochs,
                  eps_clip,
                  hidden_dim,
-                 device):
+                 device,
+                 batch_size):
+                 
         self.gamma = gamma
         self.eps_clip = eps_clip
         self.K_epochs = K_epochs
         self.device = device
+        self.batch_size = batch_size
         self.memory = []
         
         self.actor = Actor(state_dim, action_dim, hidden_dim).to(device)
@@ -66,43 +74,82 @@ class PPO:
         action_probs = self.actor(state)
         dist = Categorical(action_probs)
         action = dist.sample()
-        return action.item()
+        action_logprob = dist.log_prob(action) 
+        return action.item(), action_logprob.item()
 
-    def update(self, memory):     
-        states = torch.FloatTensor([t[0] for t in memory]).to(self.device)
-        actions = torch.LongTensor([t[1] for t in memory]).view(-1, 1).to(self.device)
-        rewards = torch.FloatTensor([t[2] for t in memory]).to(self.device)
-        next_states = torch.FloatTensor([t[3] for t in memory]).to(self.device)
-        dones = torch.FloatTensor([t[4] for t in memory]).to(self.device)
+    def update(self):     
+        # 将memory内数据转为tensor
+        states = torch.FloatTensor([t[0] for t in self.memory]).to(self.device)
+        actions = torch.LongTensor([t[1] for t in self.memory]).view(-1, 1).to(self.device)
+        logprobs_old = torch.FloatTensor([t[2] for t in self.memory]).view(-1, 1).to(self.device)
+        rewards = torch.FloatTensor([t[3] for t in self.memory]).to(self.device)
+        dones = torch.FloatTensor([t[4] for t in self.memory]).to(self.device)
         
-        V_old = self.critic(states).detach()
+        # 计算状态价值
+        V = self.critic(states).detach().squeeze()
         
+        # 计算GAE和目标值
+        advantages, returns = self.compute_gae(rewards, V, dones)
+        
+        # mini batch
         for _ in range(self.K_epochs):
-            # 计算状态价值和优势函数  
-            V_new = self.critic(states)
-            advantages = rewards + (1 - dones) * self.gamma * self.critic(next_states).detach() - V_old
-
-            # 计算动作概率和动作对应的对数概率  
-            action_probs = self.actor(states)
-            action_log_probs = torch.log(action_probs.gather(1, actions)).to(self.device)
-
-            # 计算重要性采样系数            
-            ratios = torch.exp(action_log_probs - action_log_probs.detach())
-            surr1 = ratios * advantages
-            surr2 = torch.clamp(ratios, 1-self.eps_clip, 1+self.eps_clip) * advantages
+            for indices in BatchSampler(SubsetRandomSampler(range(len(self.memory))), self.batch_size, drop_last=False):
+                mb_states = states[indices]
+                mb_actions = actions[indices]
+                mb_logprobs_old = logprobs_old[indices]
+                mb_returns = returns[indices]
+                mb_advantages = advantages[indices]
                 
-            # 计算损失
-            actor_loss = -torch.min(surr1, surr2).mean() 
-            critic_loss = self.MseLoss(V_new, rewards + (1 - dones) * self.gamma * V_old)
+                # 评估动作概率和状态价值
+                action_probs = self.actor(mb_states)
+                dist = Categorical(action_probs)
+                action_logprobs = dist.log_prob(mb_actions.squeeze()).unsqueeze(1)
+                V_new = self.critic(mb_states)
+                
+                # 计算critic损失
+                critic_loss = self.MseLoss(V_new, mb_returns)
+
+                # 计算actor损失(PPO clip)
+                ratios = torch.exp(action_logprobs - mb_logprobs_old)
+                surr1 = ratios * mb_advantages
+                surr2 = torch.clamp(ratios, 1-self.eps_clip, 1+self.eps_clip) * mb_advantages
+                actor_loss = -torch.min(surr1, surr2).mean()
+                
+                # 更新网络
+                self.actor_optimizer.zero_grad()
+                self.critic_optimizer.zero_grad()
+                actor_loss.backward()
+                critic_loss.backward()
+                self.actor_optimizer.step()
+                self.critic_optimizer.step()
+                
+        self.memory.clear()
+
+    def compute_gae(self, rewards, values, dones, tau=0.95):
+        gae = 0
+        returns = []
+        advantages = []
+
+        for step in reversed(range(len(rewards))):
+            if step == len(rewards) - 1:
+                next_value = 0  # 对于最后一步，假设下一个值为0
+            else:
+                next_value = values[step + 1]
             
-            # 更新网络
-            self.actor_optimizer.zero_grad()
-            self.critic_optimizer.zero_grad()
-            actor_loss.backward()
-            critic_loss.backward()
-            self.actor_optimizer.step()
-            self.critic_optimizer.step()
-      
+            delta = rewards[step] + self.gamma * next_value * (1 - dones[step]) - values[step]
+            gae = delta + self.gamma * tau * (1 - dones[step]) * gae
+            
+            advantages.insert(0, gae)
+            returns.insert(0, gae + values[step])
+
+        advantages = torch.tensor(advantages, dtype=torch.float32).to(self.device)
+        returns = torch.tensor(returns, dtype=torch.float32).to(self.device)
+
+        # 归一化advantages
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        return advantages, returns
+        
 # 超参数调优的目标函数     
 def objective(trial):
     # 从Optuna中获取超参数
@@ -110,7 +157,6 @@ def objective(trial):
         'actor_lr': trial.suggest_float('actor_lr', 1e-5, 1e-2, log=True),
         'critic_lr': trial.suggest_float('critic_lr', 1e-5, 1e-2, log=True),
         'hidden_dim': trial.suggest_categorical('hidden_dim', [32, 64, 128, 256, 512]),
-        'steps_per_epoch': trial.suggest_categorical('steps_per_epoch', [500, 1000, 1500, 2000, 2500]),
         'gamma': trial.suggest_float('gamma', 0.9, 0.999),
         'K_epochs': trial.suggest_categorical('K_epochs', [5, 10, 15, 20]),
         'eps_clip': trial.suggest_categorical('eps_clip', [0.1, 0.2, 0.3])   
@@ -120,8 +166,9 @@ def objective(trial):
     env = gym.make('CartPole-v1')
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.n
-    agent = PPO(state_dim, action_dim, params['actor_lr'], params['critic_lr'], params['gamma'], 
-                params['K_epochs'], params['eps_clip'], params['hidden_dim'], device)
+    agent = PPO(state_dim, action_dim, params['actor_lr'], params['critic_lr'], 
+                params['gamma'], params['K_epochs'], params['eps_clip'], 
+                params['hidden_dim'], device, batch_size=batch_size)
 
     rewards = []
     ma_rewards = [] # moving average rewards
@@ -132,23 +179,21 @@ def objective(trial):
         ep_reward = 0
 
         while not done:
-            action = agent.select_action(state)
-            next_state, reward, done, _, _ = env.step(action) 
+            action, log_prob = agent.select_action(state)
+            next_state, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
             ep_reward += reward
-            agent.memory.append((state, action, reward, next_state, done))
+            agent.memory.append((state, action, log_prob, reward, done))
             state = next_state
 
-            if len(agent.memory) >= params['steps_per_epoch']:
-                agent.update(agent.memory)
-                agent.memory.clear()
-
+        agent.update()
         rewards.append(ep_reward)
         if ma_rewards:
             ma_rewards.append(0.9*ma_rewards[-1]+0.1*ep_reward)
         else:
             ma_rewards.append(ep_reward)  
 
-        # 上报当前迭代评估指标给optuna
+        # 上报当前trial的评估分数给optuna
         trial.report(np.mean(ma_rewards[-10:]), i_episode)
 
         # 在不满足条件时提前终止实验
@@ -157,12 +202,13 @@ def objective(trial):
     
     return np.mean(rewards[-10:])
 
-# 初始化wandb，使用fork作为启动方法
+# 初始化wandb
 wandb.init(project="ppo_cartpole", settings=wandb.Settings(start_method="fork"))
 
 # 设置训练参数      
-max_episodes = 500
+max_episodes = 400
 n_trials = 25
+batch_size = 32
 
 # 设置设备
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -179,13 +225,14 @@ print("  Params: ")
 for key, value in trial.params.items():
     print("    {}: {}".format(key, value))
 
-# 训练最佳模型并可视化结果
+# 使用最佳超参数训练模型并可视化结果
 best_params = study.best_params
 env = gym.make('CartPole-v1')
 state_dim = env.observation_space.shape[0]
 action_dim = env.action_space.n
-agent = PPO(state_dim, action_dim, best_params['actor_lr'], best_params['critic_lr'], best_params['gamma'],   
-            best_params['K_epochs'], best_params['eps_clip'], best_params['hidden_dim'], device)
+agent = PPO(state_dim, action_dim, best_params['actor_lr'], best_params['critic_lr'], 
+            best_params['gamma'], best_params['K_epochs'], best_params['eps_clip'], 
+            best_params['hidden_dim'], device, batch_size=batch_size)
 
 rewards = []
 ma_rewards = [] # moving average rewards
@@ -196,15 +243,14 @@ for i_episode in range(1, max_episodes+1):
     ep_reward = 0
 
     while not done:
-        action = agent.select_action(state)
-        next_state, reward, done, _, _ = env.step(action)
+        action, log_prob = agent.select_action(state)
+        next_state, reward, terminated, truncated, _ = env.step(action)
+        done = terminated or truncated
         ep_reward += reward
-        agent.memory.append((state, action, reward, next_state, done))
+        agent.memory.append((state, action, log_prob, reward, done))
         state = next_state
-
-        if len(agent.memory) >= best_params['steps_per_epoch']:
-            agent.update(agent.memory)
-            agent.memory.clear()
+        
+    agent.update()
 
     rewards.append(ep_reward)
     if ma_rewards:
